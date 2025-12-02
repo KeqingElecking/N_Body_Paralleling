@@ -77,6 +77,9 @@
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <None Include="module1.py" />
+  </ItemGroup>
+  <ItemGroup>
     <CudaCompile Include="kernel.cu" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
