@@ -82,7 +82,7 @@
     <None Include="..\..\SDL3-3.2.28\lib\x64\SDL3.dll" />
   </ItemGroup>
   <ItemGroup>
-    <CudaCompile Include="kernel_SDL.cu" />
+    <CudaCompile Include="kernel_tree.cu" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

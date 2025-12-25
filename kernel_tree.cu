@@ -1,40 +1,40 @@
-﻿/*
- Stackless Barnes-Hut style N-body (3D) demo using CUDA.
- - Optimized: Padding NodeDev to 64 bytes for cache alignment.
- - Output: Binary file (particles.bin) for fast visualization.
- - Integration: Fully on GPU.
-*/
-
-#include <cstdio>
+﻿#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <vector>
 #include <algorithm>
 #include <ctime>
-#include <array>
-
 #include <cuda_runtime.h>
+#include <SDL3/SDL.h>
 
-// --- CUDA Stubs for IntelliSense ---
+// --- CUDA Stubs ---
 #ifndef __CUDACC__
 struct dim3 { int x, y, z; };
-extern dim3 blockIdx;
-extern dim3 blockDim;
-extern dim3 threadIdx;
+extern dim3 blockIdx; extern dim3 blockDim; extern dim3 threadIdx;
 static inline void __syncthreads() {}
 static inline float rsqrtf(float x) { return 1.0f / sqrtf(x); }
 struct float3 { float x, y, z; };
 struct float4 { float x, y, z, w; };
 static inline float3 make_float3(float x, float y, float z) { return float3{ x,y,z }; }
 static inline float4 make_float4(float x, float y, float z, float w) { return float4{ x,y,z,w }; }
-#else
 #endif
 
-#define N_DEFAULT 1000 // Tăng default lên để thấy sức mạnh GPU
-#define THETA 0.5f
-#define EPS 1e-2f
-#define CAPACITY 32     // Số lượng hạt tối đa trong 1 leaf
+// --- CONSTANTS ---
+#define N 5000              // Moderate N for CPU Tree Build
+#define THETA 0.5f          // Accuracy
+#define CAPACITY 32         // Leaf capacity
 #define MAX_DEPTH 64
+#define DT 0.005f           // Time step
+
+// Updated Constants to match kernel_SDL.cu scale
+#define EPS 0.1f            // Softening (increased for larger scale)
+#define SCALE 3.5f          // Scale (decreased because coordinates are ~100.0 now)
+
+// Graphics
+#define WINDOW_WIDTH 800
+#define WINDOW_HEIGHT 800     
+
+// --- DATA STRUCTURES (From kernel_tree.cu) ---
 
 struct Particle {
     float x, y, z;
@@ -42,19 +42,18 @@ struct Particle {
     float mass;
 };
 
-// --- OPTIMIZATION: Padded to 64 bytes ---
-// Cũ: 52 bytes. Mới: 64 bytes. Giúp khớp với Cache Line của GPU.
+// Padded Node for GPU Alignment (64 bytes)
 struct NodeDev {
-    float3 com;     // 12
-    float mass;     // 4
-    float3 center;  // 12
-    float size;     // 4
-    int more;       // 4
-    int next;       // 4
-    int start;      // 4
-    int end;        // 4
-    int isLeaf;     // 4
-    int padding[3]; // 12 bytes padding -> Total 64 bytes
+    float3 com;
+    float mass;
+    float3 center;
+    float size;
+    int more;       // "Down" pointer
+    int next;       // "Sideways" pointer
+    int start;      // Particle index start
+    int end;        // Particle index end
+    int isLeaf;
+    int padding[3];
 };
 
 struct HostNode {
@@ -75,15 +74,16 @@ static inline void checkCuda(cudaError_t e, const char* msg) {
     }
 }
 
-/* --- Host: Octree Builder (Giữ nguyên logic) --- */
+// --- HOST: TREE BUILDER (CPU Logic) ---
+
 void compute_bounds(const std::vector<Particle>& P, float& cx, float& cy, float& cz, float& h) {
     float minx = P[0].x, maxx = P[0].x;
     float miny = P[0].y, maxy = P[0].y;
     float minz = P[0].z, maxz = P[0].z;
     for (size_t i = 1; i < P.size(); ++i) {
-        minx = std::min(minx, P[i].x); maxx = std::max(maxx, P[i].x);
-        miny = std::min(miny, P[i].y); maxy = std::max(maxy, P[i].y);
-        minz = std::min(minz, P[i].z); maxz = std::max(maxz, P[i].z);
+        if (P[i].x < minx) minx = P[i].x; if (P[i].x > maxx) maxx = P[i].x;
+        if (P[i].y < miny) miny = P[i].y; if (P[i].y > maxy) maxy = P[i].y;
+        if (P[i].z < minz) minz = P[i].z; if (P[i].z > maxz) maxz = P[i].z;
     }
     cx = 0.5f * (minx + maxx);
     cy = 0.5f * (miny + maxy);
@@ -170,7 +170,6 @@ static void flatten_dfs(const std::vector<HostNode>& H, int hidx, std::vector<No
     nd.more = -1; nd.next = -1;
     nd.start = H[hidx].start; nd.end = H[hidx].end;
     nd.isLeaf = H[hidx].isLeaf ? 1 : 0;
-    // Padding init
     nd.padding[0] = 0; nd.padding[1] = 0; nd.padding[2] = 0;
 
     outNodes.push_back(nd);
@@ -188,20 +187,15 @@ void flatten_tree(const std::vector<HostNode>& H, int rootIdx, std::vector<NodeD
     std::vector<int> hostToFlat(H.size(), -1);
     for (int i = 0; i < F; ++i) hostToFlat[flatHostIndex[i]] = i;
 
-    // Build stackless links
+    // Stackless Links (More/Next)
     for (int i = 0; i < F; ++i) {
         int hidx = flatHostIndex[i];
-
-        // MORE pointer
         if (!H[hidx].children.empty()) {
             outNodes[i].more = hostToFlat[H[hidx].children[0]];
         }
-
-        // NEXT pointer
         int parent = H[hidx].parent;
         int nextFlat = -1;
         int currentHost = hidx;
-
         while (parent != -1) {
             const auto& siblings = H[parent].children;
             auto it = std::find(siblings.begin(), siblings.end(), currentHost);
@@ -216,8 +210,8 @@ void flatten_tree(const std::vector<HostNode>& H, int rootIdx, std::vector<NodeD
     }
 }
 
-/* --- GPU Kernels ----------------------------------------------------------- */
-#ifdef __CUDACC__
+// --- DEVICE: KERNELS (GPU Logic) ---
+
 __device__ float length_eps(const float3& v) {
     return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z + EPS * EPS);
 }
@@ -244,7 +238,8 @@ __global__ void compute_force_kernel(
     float3 pos = make_float3(p4.x, p4.y, p4.z);
     float3 acc = make_float3(0.0f, 0.0f, 0.0f);
 
-    int idx = 0;
+    int idx = 0; // Start at root
+    // Stackless Traversal
     while (idx != -1) {
         NodeDev node = d_nodes[idx];
         float3 d = make_float3(node.center.x - pos.x, node.center.y - pos.y, node.center.z - pos.z);
@@ -302,73 +297,100 @@ __global__ void integrate_kernel(
     particles[i] = p;
     velocities[i] = v;
 }
-#endif
 
-/* --- Simulation Loop ------------------------------------------------------- */
-void host_simulate(int N, int steps, float dt) {
-    // 1. Initial Data Generation
+// --- MAIN LOOP ---
+
+int main(int argc, char** argv) {
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        fprintf(stderr, "SDL Init Failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    SDL_Window* window = SDL_CreateWindow("CUDA Barnes-Hut Tree + Stats", WINDOW_WIDTH, WINDOW_HEIGHT, 0);
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, NULL);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+    // 1. Initial Data
     std::vector<Particle> P(N);
     std::vector<float4> ph(N), vh(N);
 
-    // Tạo cấu hình "Galaxy" xoắn ốc để đẹp hơn random
+    // --- GALAXY SETUP (From kernel_SDL.cu) ---
+    srand(1337);
     for (int i = 0; i < N; ++i) {
-        float angle = (i * 0.1f);
-        float dist = 0.1f + (i * 1.0f / N);
-        P[i].x = cos(angle) * dist;
-        P[i].y = sin(angle) * dist;
-        P[i].z = ((rand() / (float)RAND_MAX) - 0.5f) * 0.1f;
+        if (i == 0) {
+            P[i].x = 0; P[i].y = 0; P[i].z = 0;
+            P[i].vx = 0; P[i].vy = 0; P[i].vz = 0;
+            P[i].mass = 5000.0f;
+        }
+        else {
+            float angle = (i * 0.1f);
+            float dist = 100.0f + (i * 10.0f / N);
+            P[i].x = cos(angle) * dist;
+            P[i].y = sin(angle) * dist;
+            P[i].z = ((rand() / (float)RAND_MAX) - 0.5f) * 10.0f;
 
-        // Vận tốc tiếp tuyến để tạo quỹ đạo
-        float vel = sqrt(1.0f) / sqrt(dist + 0.1f);
-        P[i].vx = -sin(angle) * vel;
-        P[i].vy = cos(angle) * vel;
-        P[i].vz = 0.0f;
-        P[i].mass = 1.0f;
+            float vel = sqrt(5000.0f) / sqrt(dist); // sqrt(G * M_center / r)
+            P[i].vx = -sin(angle) * vel;
+            P[i].vy = cos(angle) * vel;
+            P[i].vz = 0.0f;
+            P[i].mass = 1.0f + ((rand() / (float)RAND_MAX));
+        }
 
+        // Copy to Float4 format for GPU
         ph[i] = make_float4(P[i].x, P[i].y, P[i].z, P[i].mass);
         vh[i] = make_float4(P[i].vx, P[i].vy, P[i].vz, 0.0f);
     }
-    // Hạt nặng ở tâm
-    ph[0] = make_float4(0, 0, 0, 100.0f); vh[0] = make_float4(0, 0, 0, 0); P[0].mass = 100.0f;
 
-    // 2. Setup Device Memory
+    // 2. Device Memory
     float4* d_particles = nullptr, * d_forces = nullptr, * d_velocities = nullptr;
     NodeDev* d_nodes = nullptr;
 
-#ifdef __CUDACC__
     checkCuda(cudaMalloc(&d_particles, N * sizeof(float4)), "Alloc P");
     checkCuda(cudaMalloc(&d_velocities, N * sizeof(float4)), "Alloc V");
     checkCuda(cudaMalloc(&d_forces, N * sizeof(float4)), "Alloc F");
     checkCuda(cudaMemcpy(d_velocities, vh.data(), N * sizeof(float4), cudaMemcpyHostToDevice), "Copy V");
-#endif
 
-    // 3. Open Binary Output File
-    const char* filename = "particles.bin";
-    FILE* fp = fopen(filename, "wb");
-    if (!fp) { perror("fopen"); exit(1); }
+    int quit = 0;
+    SDL_Event event;
 
-    // Write Header: [N] [STEPS]
-    fwrite(&N, sizeof(int), 1, fp);
-    fwrite(&steps, sizeof(int), 1, fp);
+    // --- Stats Variables ---
+    Uint64 lastTime = SDL_GetTicks();
+    int frames = 0;
+    char titleBuffer[256];
+    long totalSteps = 0;
 
-    printf("Starting simulation: N=%d Steps=%d. Output: %s\n", N, steps, filename);
+    // Accumulators for Report
+    Uint64 startWallTime = SDL_GetTicks();
+    double totalComputeMs = 0.0f;
 
-    for (int step = 0; step < steps; ++step) {
-        // --- A. Build Tree on Host ---
+    // Events for timing GPU part
+    cudaEvent_t startEvt, stopEvt;
+    cudaEventCreate(&startEvt);
+    cudaEventCreate(&stopEvt);
+
+    printf("Starting Stackless Barnes-Hut. N=%d\n", N);
+    printf("Press ESC to see Performance Report.\n");
+
+    while (!quit) {
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_EVENT_QUIT) quit = 1;
+            if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE) quit = 1;
+        }
+
+        // --- A. CPU Tree Build (Bottleneck) ---
         float cx, cy, cz, h;
         compute_bounds(P, cx, cy, cz, h);
 
         std::vector<int> indices(N);
-        for (int i = 0; i < N; ++i) indices[i] = i; // Reset indices
+        for (int i = 0; i < N; ++i) indices[i] = i;
 
         std::vector<HostNode> hostNodes;
+        hostNodes.reserve(N * 2);
         build_node(hostNodes, indices, P, 0, N, cx, cy, cz, h, -1, 0);
 
         std::vector<NodeDev> nodesDev;
         flatten_tree(hostNodes, 0, nodesDev);
 
-        // --- B. Reorder Arrays for Coalescing ---
-        // Sắp xếp lại hạt và vận tốc theo thứ tự lá cây để GPU đọc tuần tự
         std::vector<float4> ph_reordered(N), vh_reordered(N);
         for (int i = 0; i < N; ++i) {
             int oldIdx = indices[i];
@@ -376,62 +398,97 @@ void host_simulate(int N, int steps, float dt) {
             vh_reordered[i] = vh[oldIdx];
         }
 
-#ifdef __CUDACC__
-        // --- C. Copy to GPU ---
+        // --- B. GPU Compute Step (Timed) ---
+        cudaEventRecord(startEvt);
+
         checkCuda(cudaMemcpy(d_particles, ph_reordered.data(), N * sizeof(float4), cudaMemcpyHostToDevice), "H2D P");
         checkCuda(cudaMemcpy(d_velocities, vh_reordered.data(), N * sizeof(float4), cudaMemcpyHostToDevice), "H2D V");
 
-        checkCuda(cudaMalloc(&d_nodes, nodesDev.size() * sizeof(NodeDev)), "Alloc Nodes"); // Re-allocating per frame for simplicity (can optimize)
+        // Realloc nodes if needed
+        static size_t currentNodeSize = 0;
+        if (nodesDev.size() > currentNodeSize) {
+            if (d_nodes) cudaFree(d_nodes);
+            currentNodeSize = nodesDev.size() * 1.5;
+            checkCuda(cudaMalloc(&d_nodes, currentNodeSize * sizeof(NodeDev)), "Alloc Nodes");
+        }
         checkCuda(cudaMemcpy(d_nodes, nodesDev.data(), nodesDev.size() * sizeof(NodeDev), cudaMemcpyHostToDevice), "H2D Nodes");
 
-        // --- D. Run Kernels ---
         int block = 128;
         int grid = (N + block - 1) / block;
 
         compute_force_kernel << <grid, block >> > (d_particles, d_nodes, d_forces, N, THETA);
-        integrate_kernel << <grid, block >> > (d_particles, d_velocities, d_forces, N, dt);
-        checkCuda(cudaDeviceSynchronize(), "Sync");
+        integrate_kernel << <grid, block >> > (d_particles, d_velocities, d_forces, N, DT);
 
-        // --- E. Get Data Back ---
-        // Thay vì lấy Forces, ta lấy vị trí mới nhất
+        cudaEventRecord(stopEvt);
+        cudaEventSynchronize(stopEvt);
+
+        float physTimeMs = 0;
+        cudaEventElapsedTime(&physTimeMs, startEvt, stopEvt);
+        totalComputeMs += physTimeMs;
+
+        // --- C. Retrieve Data ---
         checkCuda(cudaMemcpy(ph.data(), d_particles, N * sizeof(float4), cudaMemcpyDeviceToHost), "D2H P");
         checkCuda(cudaMemcpy(vh.data(), d_velocities, N * sizeof(float4), cudaMemcpyDeviceToHost), "D2H V");
 
-        checkCuda(cudaFree(d_nodes), "Free Nodes");
-#else
-        // CPU Fallback (simplified)
-        for (int i = 0; i < N; ++i) { // Dummy move
-            ph_reordered[i].x += vh_reordered[i].x * dt;
-            ph[i] = ph_reordered[i];
-        }
-#endif
-
-        // --- F. Write Binary Frame ---
-        // Ghi toàn bộ mảng vị trí (N * float4) ra file. Cực nhanh.
-        fwrite(ph.data(), sizeof(float4), N, fp);
-
-        // Update P array for next Host Tree Build
+        // Update Host P for next tree build
         for (int i = 0; i < N; ++i) {
             P[i].x = ph[i].x; P[i].y = ph[i].y; P[i].z = ph[i].z;
             P[i].mass = ph[i].w;
-            // Lưu ý: Vận tốc cũng cần cập nhật từ vh để lần reorder sau đúng
             P[i].vx = vh[i].x; P[i].vy = vh[i].y; P[i].vz = vh[i].z;
         }
 
-        if (step % 10 == 0) { printf("\rStep %d/%d", step, steps); fflush(stdout); }
+        // --- D. Render ---
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+
+        for (int i = 0; i < N; ++i) {
+            // New Scaling Logic for larger Galaxy
+            float sx = ph[i].x * SCALE + WINDOW_WIDTH / 2.0f;
+            float sy = ph[i].y * SCALE + WINDOW_HEIGHT / 2.0f;
+            if (sx >= 0 && sx < WINDOW_WIDTH && sy >= 0 && sy < WINDOW_HEIGHT) {
+                SDL_RenderPoint(renderer, sx, sy);
+            }
+        }
+        SDL_RenderPresent(renderer);
+
+        // --- Stats ---
+        frames++;
+        totalSteps++;
+        Uint64 currentTime = SDL_GetTicks();
+        if (currentTime - lastTime >= 1000) {
+            float fps = (float)frames * 1000.0f / (float)(currentTime - lastTime);
+            snprintf(titleBuffer, sizeof(titleBuffer), "Step: %ld | GPU: %.3f ms | FPS: %.1f | N: %d", totalSteps, physTimeMs, fps, N);
+            SDL_SetWindowTitle(window, titleBuffer);
+            frames = 0;
+            lastTime = currentTime;
+        }
     }
-    printf("\nDone. Saved to particles.bin\n");
-    fclose(fp);
 
-#ifdef __CUDACC__
-    cudaFree(d_particles); cudaFree(d_velocities); cudaFree(d_forces);
-#endif
-}
+    // --- FINAL REPORT ---
+    Uint64 endWallTime = SDL_GetTicks();
+    double totalWallSecs = (double)(endWallTime - startWallTime) / 1000.0;
+    double totalComputeSecs = totalComputeMs / 1000.0;
 
-int main(int argc, char** argv) {
-    srand(1337);
-    int N = (argc >= 2) ? atoi(argv[1]) : N_DEFAULT;
-    int STEPS = (argc >= 3) ? atoi(argv[2]) : 10000;
-    host_simulate(N, STEPS, 1e-5f);
+    printf("\n=== BARNES-HUT PERFORMANCE REPORT ===\n");
+    printf("Total steps executed: %ld\n", totalSteps);
+    printf("Total time (simulation): %.6f seconds\n", totalWallSecs);
+    printf("Total compute time (GPU): %.6f seconds\n", totalComputeSecs);
+
+    if (totalSteps > 0) {
+        printf("Average total time/step: %.6f s (%.3f ms)\n",
+            totalWallSecs / totalSteps, (totalWallSecs * 1000.0) / totalSteps);
+        printf("Average compute time/step: %.6f s (%.3f ms)\n",
+            totalComputeSecs / totalSteps, totalComputeMs / totalSteps);
+    }
+
+    printf("Overhead (TreeBuild/Draw/PCIe): %.6f seconds\n", totalWallSecs - totalComputeSecs);
+    printf("=====================================\n");
+
+    cudaFree(d_particles); cudaFree(d_velocities); cudaFree(d_forces); cudaFree(d_nodes);
+    cudaEventDestroy(startEvt); cudaEventDestroy(stopEvt);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
     return 0;
 }
